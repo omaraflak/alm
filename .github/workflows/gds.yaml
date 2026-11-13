@@ -1,0 +1,113 @@
+name: gds
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  gds:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: checkout repo
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Read top module name
+        uses: mikefarah/yq@v4
+        id: top_module
+        with:
+          cmd: echo TOP_MODULE=`yq '.project.top_module' info.yaml` > $GITHUB_OUTPUT
+
+      - name: Create and publish the GDS artifact
+        uses: TinyTapeout/tt-gds-action/custom_gds@tt10
+        with:
+          top_module: ${{ steps.top_module.outputs.TOP_MODULE }}
+          gds_path: gds/${{ steps.top_module.outputs.TOP_MODULE }}.gds
+          lef_path: lef/${{ steps.top_module.outputs.TOP_MODULE }}.lef
+          verilog_path: src/project.v
+
+  precheck:
+    needs: gds
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Set up environment variables
+        shell: bash
+        run: |
+          cat << EOF >> $GITHUB_ENV
+          PDK_ROOT=/home/runner/pdk
+          PDK_VERSION=cd1748bb197f9b7af62a54507de6624e30363943
+          EOF
+
+      - name: Checkout tt-support-tools repo
+        uses: actions/checkout@v4
+        with:
+          repository: TinyTapeout/tt-support-tools
+          path: tt
+          ref: tt10
+
+      - name: Download GDS artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: tt_submission
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        shell: bash
+        working-directory: tt/precheck
+        run: pip install -r requirements.txt
+
+      - name: Install Sky130 PDK
+        uses: TinyTapeout/volare-action@v2
+        with:
+          pdk_name: sky130
+          pdk_version: ${{ env.PDK_VERSION }}
+          pdk_root: ${{ env.PDK_ROOT }}
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v30
+
+      - name: Build Nix packages
+        shell: bash
+        working-directory: tt/precheck
+        run: nix-build
+
+      - name: Run precheck
+        shell: bash
+        working-directory: tt/precheck
+        run: nix-shell --run "python precheck.py --gds ${{ github.workspace }}/tt_submission/*.gds*"
+
+      - name: Report Precheck Summary
+        if: always()
+        shell: bash
+        run: |
+          if [ -f tt/precheck/reports/results.md ]; then
+            cat tt/precheck/reports/results.md >> $GITHUB_STEP_SUMMARY
+            summary=$(tr '\n' ' ' < tt/precheck/reports/results.md)
+            echo "::notice title=Precheck Results::${summary}"
+          fi
+          if [ -f tt/precheck/reports/magic_drc.txt ] && [ -s tt/precheck/reports/magic_drc.txt ]; then
+            drc_msg=$(head -n 25 tt/precheck/reports/magic_drc.txt | tr '\n' ' ')
+            echo "::notice title=Magic DRC::${drc_msg}"
+          fi
+
+      - name: Upload reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: precheck_reports
+          path: tt/precheck/reports
+
+  viewer:
+    needs: gds
+    runs-on: ubuntu-24.04
+    permissions:
+      pages: write
+      id-token: write
+    steps:
+      - uses: TinyTapeout/tt-gds-action/viewer@tt10
